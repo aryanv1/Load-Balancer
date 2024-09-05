@@ -1,18 +1,26 @@
 #include <iostream>
+#include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
+#include <set>
 #include <queue>
 #include <algorithm>
-#include <functional>
 #include <stdexcept>
-#include <string>
+#include <functional>
+#include <memory>
 
 using namespace std;
 
-enum class RequestType {
-    TYPE_A,
-    TYPE_B,
+class Request {
+public:
+    string id;
+    string requestType;
+    unordered_map<string, string> parameters;
+    // Paramaters - Additional information that might be needed to process the request
+    // Like user preferences, special instructions, or any metadata
+    // Resolution : 1080p
+    // Format : MP4
+    // Priority : High
 };
 
 class Destination {
@@ -21,26 +29,33 @@ public:
     int requestsBeingServed = 0;
     int threshold;
 
-    Destination(const string& ip, int thresh) : ipAddress(ip), threshold(thresh) {}
+    Destination(string ip, int thresh)
+        : ipAddress(ip), threshold(thresh) {}
 
-    bool acceptRequest(const Request& request) {
+    bool acceptRequest(Request& request) {
         if (requestsBeingServed < threshold) {
             requestsBeingServed++;
+            cout << "Request accepted by " << ipAddress << ". Currently serving: " 
+                 << requestsBeingServed << " requests.\n";
             return true;
-        } else {
-            return false;
         }
+        cout << "Request rejected by " << ipAddress << " (overloaded).\n";
+        return false;
     }
 
     void completeRequest() {
-        requestsBeingServed--;
+        if (requestsBeingServed > 0) {
+            requestsBeingServed--;
+            cout << "Request completed by " << ipAddress << ". Currently serving: " 
+                 << requestsBeingServed << " requests.\n";
+        }
     }
 };
 
 class Service {
 public:
     string name;
-    unordered_set<Destination*> destinations;
+    set<Destination*> destinations;
 
     void addDestination(Destination* destination) {
         destinations.insert(destination);
@@ -51,117 +66,138 @@ public:
     }
 };
 
-class Request {
-public:
-    string id;
-    RequestType requestType;
-    unordered_map<string, string> parameters;
-};
-
 class LoadBalancer {
 protected:
-    unordered_map<RequestType, Service*> serviceMap;
+    unordered_map<string, Service*> serviceMap;
 
 public:
-    void registerService(RequestType requestType, Service* service) {
+    void registerService(const string& requestType, Service* service) {
         serviceMap[requestType] = service;
     }
 
-    unordered_set<Destination*> getDestinations(const Request& request) {
+    set<Destination*>& getDestinations(Request& request) {
+        if (serviceMap.find(request.requestType) == serviceMap.end()) {
+            throw runtime_error("No service found for the request type.");
+        }
         return serviceMap[request.requestType]->destinations;
     }
 
-    virtual Destination* balanceLoad(const Request& request) = 0;
+    virtual Destination* balanceLoad(Request& request) = 0;
 };
 
 class LeastConnectionLoadBalancer : public LoadBalancer {
 public:
-    Destination* balanceLoad(const Request& request) override;
-};
+    Destination* balanceLoad(Request& request) override {
+        auto& destinations = getDestinations(request);
+        if (destinations.empty()) throw runtime_error("No destinations available.");
 
-Destination* LeastConnectionLoadBalancer::balanceLoad(const Request& request) {
-    auto destinations = getDestinations(request);
-    auto minElem = min_element(destinations.begin(), destinations.end(),
-        [](Destination* a, Destination* b) {
-            return a->requestsBeingServed < b->requestsBeingServed;
-        });
-
-    if (minElem != destinations.end()) {
-        return *minElem;
-    } else {
-        throw runtime_error("No destination available");
+        return *min_element(destinations.begin(), destinations.end(),
+                            [](Destination* a, Destination* b) {
+                                return a->requestsBeingServed < b->requestsBeingServed;
+                            });
     }
-}
+};
 
 class RoutedLoadBalancer : public LoadBalancer {
 public:
-    Destination* balanceLoad(const Request& request) override;
-};
+    Destination* balanceLoad(Request& request) override {
+        auto& destinations = getDestinations(request);
+        if (destinations.empty()) throw runtime_error("No destinations available.");
 
-Destination* RoutedLoadBalancer::balanceLoad(const Request& request) {
-    auto destinations = getDestinations(request);
-    vector<Destination*> list(destinations.begin(), destinations.end());
-    return list[hash<string>{}(request.id) % list.size()];
-}
+        vector<Destination*> list(destinations.begin(), destinations.end());
+        size_t index = hash<string>{}(request.id) % list.size();
+        return list[index];
+    }
+};
 
 class RoundRobinLoadBalancer : public LoadBalancer {
-    unordered_map<RequestType, queue<Destination*>> destinationsForRequest;
+private:
+    unordered_map<string, queue<Destination*>> destinationQueues;
 
 public:
-    Destination* balanceLoad(const Request& request) override;
+    Destination* balanceLoad(Request& request) override {
+        auto& destinations = getDestinations(request);
+        if (destinations.empty()) throw runtime_error("No destinations available.");
 
-private:
-    queue<Destination*> convertToQueue(const unordered_set<Destination*>& destinations);
+        if (destinationQueues.find(request.requestType) == destinationQueues.end()) {
+            queue<Destination*> q;
+            for (Destination* dest : destinations) q.push(dest);
+            destinationQueues[request.requestType] = q;
+        }
+
+        Destination* destination = destinationQueues[request.requestType].front();
+        destinationQueues[request.requestType].pop();
+        destinationQueues[request.requestType].push(destination);
+        return destination;
+    }
 };
 
-Destination* RoundRobinLoadBalancer::balanceLoad(const Request& request) {
-    if (!destinationsForRequest.contains(request.requestType)) {
-        auto destinations = getDestinations(request);
-        destinationsForRequest[request.requestType] = convertToQueue(destinations);
-    }
-    auto destination = destinationsForRequest[request.requestType].front();
-    destinationsForRequest[request.requestType].pop();
-    destinationsForRequest[request.requestType].push(destination);
-    return destination;
-}
-
-queue<Destination*> RoundRobinLoadBalancer::convertToQueue(const unordered_set<Destination*>& destinations) {
-    queue<Destination*> q;
-    for (auto& d : destinations) {
-        q.push(d);
-    }
-    return q;
-}
-
 int main() {
-    // Create different types of load balancers
+    // Setup services and destinations
+    Service service;
+    Destination dest1{"192.168.0.1", 12};
+    Destination dest2{"192.168.0.2", 20};
+    Destination dest3{"192.168.0.3", 15};
+
+    service.addDestination(&dest1);
+    service.addDestination(&dest2);
+    service.addDestination(&dest3);
+
+    // Setup Load Balancers
     LeastConnectionLoadBalancer leastConnectionLB;
+    RoutedLoadBalancer routedLB;
     RoundRobinLoadBalancer roundRobinLB;
 
-    // Create a service and destinations
-    Service service;
-    service.name = "Example Service";
+    leastConnectionLB.registerService("http", &service);
+    routedLB.registerService("http", &service);
+    roundRobinLB.registerService("http", &service);
 
-    Destination destination1("192.168.1.1", 5);
-    Destination destination2("192.168.1.2", 5);
+    // Main interaction loop
+    while (true) {
+        cout << "\nChoose load balancing algorithm (1: Least Connection, 2: Routed, 3: Round Robin, 4: Exit): ";
+        int choice;
+        cin >> choice;
 
-    service.addDestination(&destination1);
-    service.addDestination(&destination2);
+        if (choice == 4) {
+            break;
+        }
 
-    // Register the service with the load balancers
-    leastConnectionLB.registerService(RequestType::TYPE_A, &service);
-    roundRobinLB.registerService(RequestType::TYPE_A, &service);
+        LoadBalancer* lb = nullptr;
+        switch (choice) {
+            case 1:
+                lb = &leastConnectionLB;
+                break;
+            case 2:
+                lb = &routedLB;
+                break;
+            case 3:
+                lb = &roundRobinLB;
+                break;
+            default:
+                cout << "Invalid choice. Try again.\n";
+                continue;
+        }
 
-    // Create a request
-    Request request{"12345", RequestType::TYPE_A, {{"key", "value"}}};
+        // Simulate request
+        Request request;
+        string id;
+        cout << "Enter request ID: ";
+        cin >> id;
+        request.id = "REQ" + id;
+        request.requestType = "http";
 
-    // Balance the load using different strategies
-    Destination* selectedDestination1 = leastConnectionLB.balanceLoad(request);
-    Destination* selectedDestination2 = roundRobinLB.balanceLoad(request);
+        try {
+            Destination* destination = lb->balanceLoad(request);
+            cout << "Request routed to: " << destination->ipAddress << "\n";
 
-    // Output selected destinations
-    cout << "Least Connection selected: " << selectedDestination1->ipAddress << endl;
-    cout << "Round Robin selected: " << selectedDestination2->ipAddress << endl;
+            // Simulate request completion (in real life, this would happen asynchronously)
+            destination->completeRequest();
+        } catch (const exception& e) {
+            cout << "Error: " << e.what() << "\n";
+            // e -> exception
+            // what() -> function of exception that return description of error in terms of string
+        }
+    }
 
     return 0;
 }
